@@ -1,4 +1,5 @@
-use regexml::Regex;
+use regexml::{Error, Regex};
+use std::time::{Duration, Instant};
 
 #[test]
 fn test_is_match_simple() {
@@ -262,4 +263,127 @@ fn test_is_full_match_empty() {
     assert!(regex.is_full_match(""));
     assert!(regex.is_full_match("a"));
     assert!(!regex.is_full_match("aa"));
+}
+
+// The number of operations a match takes, found by bisecting the budget: the
+// smallest budget the match completes within is what it costs. Matching is
+// deterministic, so a budget that is enough once is enough always.
+fn ops_used(regex: &Regex, haystack: &str, ceiling: usize) -> usize {
+    assert!(regex.is_full_match_bounded(haystack, ceiling).is_ok());
+    let mut low = 0;
+    let mut high = ceiling;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if regex.is_full_match_bounded(haystack, mid).is_ok() {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
+}
+
+// A label-shaped pattern, of the kind that appears in XML Schema pattern
+// facets, against a subject of the length such a facet sees.
+const LABEL_PATTERN: &str = r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+";
+const LABEL_SUBJECT: &str = "abc-def.ghi-jkl.mno-pqr.stu-vwx.yz0-123.456-789.abcdefgh";
+
+#[test]
+fn test_is_full_match_bounded_ordinary_patterns() {
+    // measured: 6 operations for the literal, 253 for the label
+    let regex = Regex::xsd("application/json", "").unwrap();
+    assert_eq!(
+        regex.is_full_match_bounded("application/json", 1000),
+        Ok(true)
+    );
+    assert_eq!(
+        regex.is_full_match_bounded("application/jsom", 1000),
+        Ok(false)
+    );
+
+    let regex = Regex::xsd(LABEL_PATTERN, "").unwrap();
+    assert_eq!(regex.is_full_match_bounded(LABEL_SUBJECT, 10_000), Ok(true));
+    assert!(ops_used(&regex, LABEL_SUBJECT, 10_000) < 1000);
+
+    // rejecting costs more than accepting: every way of splitting the subject
+    // has to be tried before the pattern can be ruled out (measured: 1017)
+    let rejected = "abc-def.ghi-jkl.mno-pqr.stu-vwx.yz0-123.456-789.abcdefg!";
+    assert_eq!(regex.is_full_match_bounded(rejected, 10_000), Ok(false));
+    assert!(ops_used(&regex, rejected, 10_000) < 10_000);
+}
+
+#[test]
+fn test_is_full_match_bounded_refuses_catastrophic_backtracking() {
+    // (a+)+ against a subject with no b takes exponential time unbounded: the
+    // engine tries every way of splitting the a's between the two repeats
+    let regex = Regex::xsd("(a+)+b", "").unwrap();
+    let haystack = "a".repeat(30);
+
+    let start = Instant::now();
+    assert_eq!(
+        regex.is_full_match_bounded(&haystack, 10_000),
+        Err(Error::BudgetExceeded)
+    );
+    assert!(start.elapsed() < Duration::from_millis(100));
+
+    // a budget a hundred times larger buys no answer either, it only takes
+    // longer to give up
+    assert_eq!(
+        regex.is_full_match_bounded(&haystack, 1_000_000),
+        Err(Error::BudgetExceeded)
+    );
+}
+
+#[test]
+fn test_is_full_match_bounded_never_answers_from_an_exhausted_budget() {
+    // "a|ab" needs to backtrack into the second branch to match "ab" (14
+    // operations); cut off halfway it must refuse, not report "no match"
+    let regex = Regex::xsd("a|ab", "").unwrap();
+    assert_eq!(regex.is_full_match_bounded("ab", 100), Ok(true));
+    assert_eq!(
+        regex.is_full_match_bounded("ab", 7),
+        Err(Error::BudgetExceeded)
+    );
+    assert_eq!(
+        regex.is_full_match_bounded("ab", 0),
+        Err(Error::BudgetExceeded)
+    );
+}
+
+#[test]
+fn test_is_full_match_bounded_is_deterministic() {
+    // the budget counts operations, not time, so repeating a call repeats its
+    // outcome and its cost exactly
+    let regex = Regex::xsd(LABEL_PATTERN, "").unwrap();
+    assert_eq!(
+        ops_used(&regex, LABEL_SUBJECT, 10_000),
+        ops_used(&regex, LABEL_SUBJECT, 10_000)
+    );
+
+    let regex = Regex::xsd("(a+)+b", "").unwrap();
+    let haystack = "a".repeat(30);
+    assert_eq!(
+        regex.is_full_match_bounded(&haystack, 10_000),
+        regex.is_full_match_bounded(&haystack, 10_000)
+    );
+}
+
+#[test]
+fn test_is_full_match_bounded_matches_the_unbounded_answer() {
+    for (pattern, haystack) in [
+        ("a", "a"),
+        ("a", "ab"),
+        ("a|ab", "ab"),
+        ("a?", ""),
+        ("(a+)+b", "aaaab"),
+        ("(a+)+b", "aaaac"),
+        (LABEL_PATTERN, LABEL_SUBJECT),
+    ] {
+        let regex = Regex::xsd(pattern, "").unwrap();
+        assert_eq!(
+            regex.is_full_match_bounded(haystack, 100_000),
+            Ok(regex.is_full_match(haystack)),
+            "{pattern} against {haystack}"
+        );
+    }
 }

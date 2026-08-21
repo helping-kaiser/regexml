@@ -83,7 +83,7 @@ impl OperationControl for Choice {
         false
     }
 
-    fn matches_iter<'a>(
+    fn matches_iter_impl<'a>(
         &'a self,
         matcher: &'a ReMatcher<'a>,
         position: usize,

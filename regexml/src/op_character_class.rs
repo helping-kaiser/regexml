@@ -35,7 +35,7 @@ impl OperationControl for CharClass {
         Operation::from(self)
     }
 
-    fn matches_iter<'b>(
+    fn matches_iter_impl<'b>(
         &self,
         matcher: &'b crate::re_matcher::ReMatcher,
         position: usize,

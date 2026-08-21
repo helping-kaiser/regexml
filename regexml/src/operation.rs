@@ -81,7 +81,11 @@ pub(crate) trait OperationControl {
     /// with information about captured groups.
     ///
     /// The position is the start position to seek a match.
-    fn matches_iter<'a>(
+    ///
+    /// This is the raw implementation; everything that walks the operation
+    /// tree calls [`Operation::matches_iter`] instead, so that the steps it
+    /// takes are counted against the matcher's budget.
+    fn matches_iter_impl<'a>(
         &'a self,
         matcher: &'a ReMatcher<'a>,
         position: usize,
@@ -131,6 +135,35 @@ pub(crate) enum Operation {
 }
 
 impl Operation {
+    /// Get an iterator returning all the matches for this operation, counting
+    /// the work it does against the matcher's operation budget.
+    ///
+    /// Every step of the backtracking walk passes through here: an operation
+    /// can only hand control to a sub-operation by asking it for an iterator,
+    /// and can only make progress by pulling the next match out of one. So
+    /// counting both events bounds the total work done by a match, and a
+    /// bounded match that runs out of budget stops producing matches, which
+    /// unwinds the walk.
+    ///
+    /// When no budget is set (the default) the iterator is returned as-is, so
+    /// unbounded matching does no extra allocation.
+    pub(crate) fn matches_iter<'a>(
+        &'a self,
+        matcher: &'a ReMatcher<'a>,
+        position: usize,
+    ) -> Box<dyn Iterator<Item = usize> + 'a> {
+        if !matcher.is_bounded() {
+            return self.matches_iter_impl(matcher, position);
+        }
+        if !matcher.tick() {
+            return Box::new(std::iter::empty());
+        }
+        Box::new(BudgetIterator {
+            matcher,
+            base: self.matches_iter_impl(matcher, position),
+        })
+    }
+
     pub(crate) fn repeat_operation(&self) -> Option<&dyn RepeatOperation> {
         match self {
             Operation::Repeat(repeat) => Some(repeat),
@@ -139,6 +172,25 @@ impl Operation {
             Operation::UnambiguousRepeat(unambiguous_repeat) => Some(unambiguous_repeat),
             _ => None,
         }
+    }
+}
+
+// The BudgetIterator counts every match it produces against the matcher's
+// operation budget. Once the budget is used up it stops producing matches,
+// which makes the operations above it in the walk backtrack and give up.
+struct BudgetIterator<'a> {
+    matcher: &'a ReMatcher<'a>,
+    base: Box<dyn Iterator<Item = usize> + 'a>,
+}
+
+impl Iterator for BudgetIterator<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.matcher.tick() {
+            return None;
+        }
+        self.base.next()
     }
 }
 

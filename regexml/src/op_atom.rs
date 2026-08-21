@@ -57,7 +57,7 @@ impl OperationControl for Atom {
         Operation::from(self)
     }
 
-    fn matches_iter<'a>(
+    fn matches_iter_impl<'a>(
         &self,
         matcher: &'a ReMatcher,
         position: usize,

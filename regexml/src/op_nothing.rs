@@ -21,7 +21,7 @@ impl OperationControl for Nothing {
         Operation::from(self)
     }
 
-    fn matches_iter(
+    fn matches_iter_impl(
         &self,
         _matcher: &ReMatcher,
         position: usize,

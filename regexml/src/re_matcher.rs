@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[cfg(test)]
 use crate::operation::Operation;
@@ -7,7 +7,6 @@ use icu_casemap::CaseMapper;
 use crate::{history::History, op_repeat::Repeat};
 
 use crate::{
-    operation::OperationControl,
     re_compiler::Error,
     re_program::{ReProgram, OPT_HASBACKREFS, OPT_HASBOL},
 };
@@ -22,6 +21,13 @@ pub(crate) struct ReMatcher<'a> {
     case_mapper: CaseMapper,
     // parenthesized subexpressions
     state: RefCell<State>,
+    // remaining operations a bounded match may still perform; None for an
+    // unbounded match. Kept out of `state` because it is ticked while the
+    // operations are matching, which may be holding a borrow of `state`.
+    budget: Cell<Option<usize>>,
+    // set when a bounded match ran out of budget, so that the caller can tell
+    // "no match" from "gave up"
+    budget_exceeded: Cell<bool>,
 }
 
 #[derive(Debug)]
@@ -53,6 +59,32 @@ impl<'a> ReMatcher<'a> {
             search,
             state: RefCell::new(State::new()),
             case_mapper: CaseMapper::new(),
+            budget: Cell::new(None),
+            budget_exceeded: Cell::new(false),
+        }
+    }
+
+    /// Whether this matcher counts the operations a match performs.
+    pub(crate) fn is_bounded(&self) -> bool {
+        self.budget.get().is_some()
+    }
+
+    /// Account for one operation of a bounded match.
+    ///
+    /// Returns `false` once the budget is used up; the matching operations
+    /// then stop producing matches, which unwinds the walk. An unbounded
+    /// matcher always returns `true`.
+    pub(crate) fn tick(&self) -> bool {
+        match self.budget.get() {
+            None => true,
+            Some(0) => {
+                self.budget_exceeded.set(true);
+                false
+            }
+            Some(remaining) => {
+                self.budget.set(Some(remaining - 1));
+                true
+            }
         }
     }
 
@@ -190,6 +222,28 @@ impl<'a> ReMatcher<'a> {
         self.state.borrow_mut().capture_state = CaptureState::new();
 
         self.match_at(0, true)
+    }
+
+    /// Like [`ReMatcher::is_full_match`], but performing at most `ops_budget`
+    /// operations.
+    ///
+    /// Returns an error instead of an answer if the match did not finish
+    /// within that budget. The budget counts operations, not time, so the
+    /// same pattern and input give the same answer on every machine.
+    pub(crate) fn is_full_match_bounded(&mut self, ops_budget: usize) -> Result<bool, Error> {
+        // clear the captured group state
+        self.state.borrow_mut().capture_state = CaptureState::new();
+
+        self.budget.set(Some(ops_budget));
+        self.budget_exceeded.set(false);
+        let matched = self.match_at(0, true);
+        self.budget.set(None);
+
+        if self.budget_exceeded.get() {
+            Err(Error::BudgetExceeded)
+        } else {
+            Ok(matched)
+        }
     }
 
     fn check_preconditions(&self, start: usize) -> bool {

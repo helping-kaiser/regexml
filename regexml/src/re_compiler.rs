@@ -65,6 +65,8 @@ pub enum Error {
     MatchesEmptyString,
     /// Replacement string is invalid (FORX0004)
     InvalidReplacementString(String),
+    /// Matching did not complete within the operation budget given to it
+    BudgetExceeded,
 }
 
 impl Error {

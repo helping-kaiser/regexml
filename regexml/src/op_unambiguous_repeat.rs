@@ -67,7 +67,7 @@ impl OperationControl for UnambiguousRepeat {
             || self.operation.contains_capturing_expressions()
     }
 
-    fn matches_iter<'a>(
+    fn matches_iter_impl<'a>(
         &self,
         matcher: &'a ReMatcher,
         position: usize,

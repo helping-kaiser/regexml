@@ -21,7 +21,7 @@ impl OperationControl for EndProgram {
         Operation::from(self)
     }
 
-    fn matches_iter(
+    fn matches_iter_impl(
         &self,
         matcher: &ReMatcher,
         position: usize,

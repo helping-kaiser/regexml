@@ -76,7 +76,7 @@ impl OperationControl for Repeat {
             || self.operation.contains_capturing_expressions()
     }
 
-    fn matches_iter<'a>(
+    fn matches_iter_impl<'a>(
         &'a self,
         matcher: &'a ReMatcher,
         position: usize,

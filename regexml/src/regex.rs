@@ -59,6 +59,32 @@ impl Regex {
         matcher.is_full_match()
     }
 
+    /// Returns `true` if the whole argument matches this regular expression,
+    /// giving up if the match takes more than `ops_budget` operations.
+    ///
+    /// A backtracking engine can take exponential time on patterns such as
+    /// `(a+)+b`. This is [`Regex::is_full_match`] with a ceiling on the amount
+    /// of work it may do: if the match does not complete within the budget,
+    /// [`Error::BudgetExceeded`] is returned rather than an answer.
+    ///
+    /// The budget counts matching operations rather than elapsed time, so the
+    /// same pattern, input and budget always give the same outcome, no matter
+    /// how fast the machine is.
+    ///
+    /// ```
+    /// # use regexml::{Regex, Error};
+    /// let regex = Regex::xsd("(a+)+b", "").unwrap();
+    /// assert_eq!(regex.is_full_match_bounded("aaab", 1000), Ok(true));
+    /// assert_eq!(
+    ///     regex.is_full_match_bounded(&"a".repeat(30), 1000),
+    ///     Err(Error::BudgetExceeded)
+    /// );
+    /// ```
+    pub fn is_full_match_bounded(&self, haystack: &str, ops_budget: usize) -> Result<bool, Error> {
+        let mut matcher = self.matcher(haystack);
+        matcher.is_full_match_bounded(ops_budget)
+    }
+
     // returns an error if this regex is known to match an empty string.
     // caches the last result so it doesn't have to do the match again.
     fn check_matches_empty_string(&self) -> Result<(), Error> {

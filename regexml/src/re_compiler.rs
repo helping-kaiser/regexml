@@ -749,8 +749,12 @@ impl ReCompiler {
                         // '*' and '+' are equivalent
                         quantifier_type = Some('*');
                     }
-                    Some('{') => {
-                        // bounds are meaningless
+                    Some('{') if self.re_flags.language() != Language::XSD => {
+                        // Retain the upstream XPath traversal. In XSD, nullable
+                        // operands still have a meaningful upper bound: (a?){2}
+                        // cannot match aaa. Every XSD matching entry point handles
+                        // empty iterations without discarding either bound.
+                        // XPath keeps its known nullable-count defects.
                         quantifier_type = Some('*')
                     }
                     _ => {}
@@ -795,6 +799,9 @@ impl ReCompiler {
             Ok(Operation::from(Nothing))
         } else if min == 1 && max == 1 {
             Ok(ret)
+        } else if self.re_flags.language() == Language::XSD {
+            // All XSD repetitions share the count-indexed endpoint search.
+            Ok(Operation::from(Repeat::new(ret, min, max, true)))
         } else if greedy {
             // actually do the quantifier now
             if let Some(match_length) = ret.get_match_length() {

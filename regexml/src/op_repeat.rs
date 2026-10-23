@@ -3,7 +3,7 @@ use crate::{
     operation::{
         ForceProgressIterator, Operation, OperationControl, RepeatOperation, MATCHES_ZLS_ANYWHERE,
     },
-    re_flags::ReFlags,
+    re_flags::{Language, ReFlags},
     re_matcher::ReMatcher,
 };
 
@@ -15,6 +15,8 @@ pub(crate) struct Repeat {
     pub(crate) min: usize,
     pub(crate) max: usize,
     pub(crate) greedy: bool,
+    xsd: bool,
+    nullable: bool,
 }
 
 impl Repeat {
@@ -24,6 +26,8 @@ impl Repeat {
             min,
             max,
             greedy,
+            xsd: false,
+            nullable: false,
         }
     }
 }
@@ -49,7 +53,9 @@ impl OperationControl for Repeat {
 
     fn optimize(self, flags: &ReFlags) -> Operation {
         let operation = self.operation.optimize(flags);
-        let min = if self.min == 0 && operation.matches_empty_string() == MATCHES_ZLS_ANYWHERE {
+        let xsd = flags.language() == Language::XSD;
+        let nullable = operation.matches_empty_string() == MATCHES_ZLS_ANYWHERE;
+        let min = if !xsd && self.min == 0 && nullable {
             // turns (a?)* into (a?)+
             1
         } else {
@@ -60,6 +66,8 @@ impl OperationControl for Repeat {
             min,
             max: self.max,
             greedy: self.greedy,
+            xsd,
+            nullable,
         })
     }
 
@@ -81,6 +89,9 @@ impl OperationControl for Repeat {
         matcher: &'a ReMatcher,
         position: usize,
     ) -> Box<dyn Iterator<Item = usize> + 'a> {
+        if self.xsd {
+            return self.xsd_matches(matcher, position);
+        }
         let mut iterators: Vec<Box<dyn Iterator<Item = usize>>> = Vec::new();
         let mut positions = Vec::new();
         let bound = self.max.min(matcher.search.len() - position + 1);
@@ -139,6 +150,51 @@ impl OperationControl for Repeat {
 
     fn children(&self) -> Vec<Operation> {
         vec![self.operation.as_ref().clone()]
+    }
+}
+
+impl Repeat {
+    // XSD has no backreferences or position-dependent empty matches, so a
+    // (position, iteration count) state has the same continuations on every
+    // visit. Expand each state once instead of walking duplicate derivations.
+    // For nullable L, L{min,max} = (L minus epsilon){0,max}: ignore empty
+    // transitions and pad the minimum. Otherwise retain the exact minimum.
+    // Every explored transition consumes at least one subject character.
+    // An unbounded maximum is therefore capped at subject length plus one;
+    // finite maxima can use the same cap. Empty padding needs no states even
+    // when the declared minimum exceeds that cap. There are at most
+    // (remaining length + 1) * (count bound + 1) states per invocation.
+    // Every operand evaluation and pull still uses Operation::matches_iter.
+    // This bounds repeated derivations, not arbitrary operand evaluation cost.
+    //
+    // Yield distinct endpoints in descending position order. XSD promises no
+    // greedy-first preference: replace_all, tokenize and analyze may report a
+    // different valid match. Captures inside repetitions can retain spans from
+    // an explored path, not the reported derivation. XPath keeps its traversal.
+    fn xsd_matches<'a>(
+        &'a self,
+        matcher: &'a ReMatcher,
+        position: usize,
+    ) -> Box<dyn Iterator<Item = usize> + 'a> {
+        let bound = self.max.min(matcher.search.len().saturating_add(1));
+        let minimum = if self.nullable { 0 } else { self.min };
+        let mut reached = std::collections::BTreeSet::new();
+        let mut seen = std::collections::BTreeSet::from([(position, 0)]);
+        let mut pending = std::collections::VecDeque::from([(position, 0)]);
+        while let Some((start, count)) = pending.pop_front() {
+            if count >= minimum {
+                reached.insert(start);
+            }
+            if count == bound {
+                continue;
+            }
+            for end in self.operation.matches_iter(matcher, start) {
+                if end > start && seen.insert((end, count + 1)) {
+                    pending.push_back((end, count + 1));
+                }
+            }
+        }
+        Box::new(reached.into_iter().rev())
     }
 }
 
@@ -293,6 +349,140 @@ impl Iterator for ReluctantRepeatIterator<'_> {
 #[cfg(test)]
 mod tests {
     use crate::Regex;
+
+    #[test]
+    fn test_nullable_counted_xsd() {
+        // Minimum completing budget measures engine operations, not wall time.
+        let operations = |regex: &Regex, subject: &str| {
+            let mut high = 10_000;
+            assert!(
+                regex.is_full_match_bounded(subject, high).is_ok(),
+                "operation ceiling: {subject:?}"
+            );
+            let mut low = 0;
+            while low + 1 < high {
+                let middle = low + (high - low) / 2;
+                if regex.is_full_match_bounded(subject, middle).is_err() {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            high
+        };
+        let costly = Regex::xsd("(a|a|a|a|a|aa)+c", "").unwrap();
+        for length in [3, 5, 7, 12, 30] {
+            let subject = "a".repeat(length);
+            let count = operations(&costly, &subject);
+            let full = costly.is_full_match(&subject);
+            let search = costly.is_match(&subject);
+            let bounded = costly.is_full_match_bounded(&subject, 10_000);
+            assert!(!full && !search, "length={length}");
+            assert_eq!(bounded, Ok(false), "length={length}, operations={count}");
+            assert_eq!(costly.replace_all(&subject, "X"), Ok(subject.clone()));
+            assert_eq!(
+                costly.tokenize(&subject).unwrap().collect::<Vec<_>>(),
+                vec![subject.clone()]
+            );
+            assert_eq!(
+                costly.analyze(&subject).unwrap().collect::<Vec<_>>(),
+                vec![crate::analyze_string::AnalyzeEntry::NonMatch(subject)]
+            );
+        }
+        let preference = Regex::xsd("(a|ab|){1,2}.", "").unwrap();
+        assert_eq!(preference.replace_all("abc", "X"), Ok("X".to_owned()));
+        assert_eq!(
+            preference.tokenize("abc").unwrap().collect::<Vec<_>>(),
+            vec!["", ""]
+        );
+        assert_eq!(
+            preference.analyze("abc").unwrap().collect::<Vec<_>>(),
+            vec![crate::analyze_string::AnalyzeEntry::Match(vec![
+                crate::analyze_string::MatchEntry::String("ab".to_owned()),
+                crate::analyze_string::MatchEntry::Group {
+                    nr: 1,
+                    value: vec![]
+                },
+                crate::analyze_string::MatchEntry::String("c".to_owned()),
+            ])]
+        );
+        let nullable = Regex::xsd("(a?){5}", "").unwrap();
+        let found = nullable.is_match("aa");
+        let nullable = Regex::xsd("(a?){2}", "").unwrap();
+        let empty = nullable.is_match("");
+        let replacement = nullable.replace_all("bbb", "X");
+        assert!(found, "(a?){{5}} must find aa");
+        assert!(empty, "(a?){{2}} must match the empty string");
+        assert_eq!(
+            replacement,
+            Err(crate::Error::MatchesEmptyString),
+            "nullable replacement must refuse"
+        );
+        for duplicates in [4, 5, 6] {
+            let pattern = format!("({}aa)+ab", "a|".repeat(duplicates));
+            let regex = Regex::xsd(&pattern, "").unwrap();
+            for subject in ["aab", "aaab", "aaaab"] {
+                let full = regex.is_full_match(subject);
+                let bounded = regex.is_full_match_bounded(subject, 100_000);
+                let search = regex.is_match(subject);
+                assert!(full, "whole match: {pattern} / {subject:?}");
+                assert_eq!(bounded, Ok(true), "bounded match: {pattern} / {subject:?}");
+                assert!(search, "search: {pattern} / {subject:?}");
+            }
+        }
+        for (pattern, subject, retained) in [
+            ("^(a?){2}$", "aaa", true),
+            ("^(a?){0}$", "a", true),
+            ("^(a?){20}a{20}$", "aaaaaaaaaaaaaaaaaaaa", false),
+            ("^(a|a|a|a|a|aa)+ab$", "aab", false),
+        ] {
+            let actual = Regex::xpath(pattern, "").unwrap().is_match(subject);
+            assert_eq!(
+                actual, retained,
+                "XPath traversal remains unchanged: {pattern} / {subject:?}"
+            );
+        }
+        let suffix = Regex::xsd("(a?){2}b", "").unwrap();
+        assert_eq!(suffix.replace_all("aab", "X"), Ok("X".to_owned()));
+        let duplicate = Regex::xsd("(a|a|a|a|a|aa)+ab", "").unwrap();
+        assert_eq!(
+            duplicate.is_full_match_bounded("aab", 1),
+            Err(crate::Error::BudgetExceeded)
+        );
+        for (pattern, subject, expected) in [
+            ("(a|aa){2}", "aa", true),
+            ("(a|aa){2}", "a", false),
+            ("(a|aa){2}", "aaaa", true),
+            ("(a|aa){2}", "aaaaa", false),
+            ("(a|aa){20,}", "aaa", false),
+            ("(a?){20,}", "a", true),
+            ("(|a){1000000}", "aa", true),
+            ("(a?){0}a{0}", "a", false),
+            ("(a?){2}", "", true),
+            ("(a?){2}", "aa", true),
+            ("(a?){2}", "aaa", false),
+            ("(a?){20}a{20}", "aaaaaaaaaaaaaaaaaaaa", true),
+            ("(a*){8}", "", true),
+            ("(|a){8}", "aaa", true),
+            ("((a?){2}){3}", "aaaaaa", true),
+            ("((a?){2}){3}", "aaaaaaa", false),
+            ("(a?){3,5}", "a", true),
+            ("(a?){3,5}", "aaaaaa", false),
+            ("(a?){3,}", "", true),
+        ] {
+            let regex = Regex::xsd(pattern, "").unwrap();
+            assert_eq!(
+                regex.is_full_match_bounded(subject, 100_000),
+                Ok(expected),
+                "{pattern} / {subject:?}"
+            );
+            assert_eq!(
+                regex.is_full_match(subject),
+                expected,
+                "{pattern} / {subject:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_repeat_simple() {
